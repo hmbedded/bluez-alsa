@@ -22,12 +22,12 @@ Installation
 
 	$ autoreconf --install
 	$ mkdir build && cd build
-	$ ../configure --enable-aac --enable-debug
+	$ ../configure --enable-debug --enable-aac --enable-msbc
 
 or if you intend to stream audio from a Linux distribution using PulseAudio (see [this
 issue](https://github.com/Arkq/bluez-alsa/issues/13))
 
-	$ ../configure --enable-aac --enable-debug --disable-payloadcheck
+	$ ../configure --enable-debug --enable-aac --enable-msbc --disable-payloadcheck
 
 then
 

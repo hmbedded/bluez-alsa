@@ -926,8 +926,11 @@ int transport_acquire_bt_sco(struct ba_transport *t) {
 
 	/* XXX: It seems, that the MTU values returned by the HCI interface
 	 *      are incorrect (or our interpretation of them is incorrect). */
+	debug("HCI MTU: R:%zu W:%zu", t->mtu_read, t->mtu_write);
 	t->mtu_read = 48;
 	t->mtu_write = 48;
+	if (t->codec == HFP_CODEC_MSBC)
+		t->mtu_read = t->mtu_write = 24;
 
 	debug("New SCO link: %d (MTU: R:%zu W:%zu)", t->bt_fd, t->mtu_read, t->mtu_write);
 

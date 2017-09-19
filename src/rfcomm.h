@@ -11,6 +11,10 @@
 #ifndef BLUEALSA_RFCOMM_H_
 #define BLUEALSA_RFCOMM_H_
 
+#if HAVE_CONFIG_H
+# include "config.h"
+#endif
+
 #include "at.h"
 #include "hfp.h"
 #include "transport.h"
@@ -54,6 +58,11 @@ struct rfcomm_conn {
 	/* variables used for AG<->HF sync */
 	uint8_t spk_gain;
 	uint8_t mic_gain;
+
+#if ENABLE_MSBC
+	/* determine whether mSBC is available */
+	bool msbc;
+#endif
 
 	/* associated transport */
 	struct ba_transport *t;

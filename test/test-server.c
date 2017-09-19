@@ -30,6 +30,7 @@
 #include "../src/io.c"
 #undef io_thread_a2dp_sink_sbc
 #undef io_thread_a2dp_source_sbc
+#include "../src/msbc.c"
 #include "../src/rfcomm.c"
 #define transport_acquire_bt_a2dp _transport_acquire_bt_a2dp
 #include "../src/transport.c"

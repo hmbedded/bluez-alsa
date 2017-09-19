@@ -4,6 +4,7 @@
 TESTS = \
 	test-at \
 	test-io \
+	test-msbc \
 	test-utils
 
 if ENABLE_PCM_TEST
@@ -13,6 +14,7 @@ endif
 check_PROGRAMS = \
 	test-at \
 	test-io \
+	test-msbc \
 	test-pcm \
 	test-server \
 	test-utils

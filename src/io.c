@@ -37,6 +37,7 @@
 #include "a2dp-codecs.h"
 #include "a2dp-rtp.h"
 #include "bluealsa.h"
+#include "msbc.h"
 #include "transport.h"
 #include "utils.h"
 #include "shared/ffb.h"
@@ -1163,6 +1164,11 @@ void *io_thread_sco(void *arg) {
 	pthread_cleanup_push(CANCEL_ROUTINE(ffb_free), &bt_in);
 	pthread_cleanup_push(CANCEL_ROUTINE(ffb_free), &bt_out);
 
+#if ENABLE_MSBC
+	struct esco_msbc msbc = { .init = false };
+	pthread_cleanup_push(CANCEL_ROUTINE(msbc_finish), &msbc);
+#endif
+
 	/* these buffers shall be bigger than the SCO MTU */
 	if (ffb_init(&bt_in, 128) == -1 || ffb_init(&bt_out, 128) == -1) {
 		error("Couldn't create data buffer: %s", strerror(ENOMEM));
@@ -1190,6 +1196,20 @@ void *io_thread_sco(void *arg) {
 		pfds[3].fd = pfds[4].fd = -1;
 
 		switch (t->codec) {
+#if ENABLE_MSBC
+		case HFP_CODEC_MSBC:
+			msbc_encode(&msbc);
+			msbc_decode(&msbc);
+			if (t->mtu_read > 0 && ffb_len_in(&msbc.dec_data) >= t->mtu_read)
+				pfds[1].fd = t->bt_fd;
+			if (t->mtu_write > 0 && ffb_len_out(&msbc.enc_data) >= t->mtu_write)
+				pfds[2].fd = t->bt_fd;
+			if (t->mtu_write > 0 && ffb_len_in(&msbc.enc_pcm) >= t->mtu_write)
+				pfds[3].fd = t->sco.spk_pcm.fd;
+			if (ffb_len_out(&msbc.dec_pcm) > 0)
+				pfds[4].fd = t->sco.mic_pcm.fd;
+			break;
+#endif
 		case HFP_CODEC_CVSD:
 		default:
 			if (t->mtu_read > 0 && ffb_len_in(&bt_in) >= t->mtu_read)
@@ -1248,8 +1268,16 @@ void *io_thread_sco(void *arg) {
 				transport_release_bt_sco(t);
 				asrs.frames = 0;
 			}
-			else
+			else {
 				transport_acquire_bt_sco(t);
+#if ENABLE_MSBC
+				/* this can be called again, make sure it is idempotent */
+				if (t->codec == HFP_CODEC_MSBC && msbc_init(&msbc) != 0) {
+					error("Couldn't initialize mSBC codec: %s", strerror(errno));
+					goto fail;
+				}
+#endif
+			}
 
 			continue;
 		}
@@ -1265,6 +1293,12 @@ void *io_thread_sco(void *arg) {
 			ssize_t len;
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				buffer = msbc.dec_data.tail;
+				buffer_len = ffb_len_in(&msbc.dec_data);
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				buffer = bt_in.tail;
@@ -1288,6 +1322,11 @@ retry_sco_read:
 				}
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				ffb_seek(&msbc.dec_data, len);
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				ffb_seek(&bt_in, len);
@@ -1307,6 +1346,12 @@ retry_sco_read:
 			ssize_t len;
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				buffer = msbc.enc_data.data;
+				buffer_len = t->mtu_write;
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				buffer = bt_out.data;
@@ -1330,6 +1375,11 @@ retry_sco_write:
 				}
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				ffb_rewind(&msbc.enc_data, len);
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				ffb_rewind(&bt_out, len);
@@ -1344,6 +1394,12 @@ retry_sco_write:
 			ssize_t samples;
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				buffer = (int16_t *)msbc.enc_pcm.tail;
+				samples = ffb_len_in(&msbc.enc_pcm) / sizeof(int16_t);
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				buffer = (int16_t *)bt_out.tail;
@@ -1361,6 +1417,11 @@ retry_sco_write:
 				snd_pcm_scale_s16le(buffer, samples, 1, 0, 0);
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				ffb_seek(&msbc.enc_pcm, samples * sizeof(int16_t));
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				ffb_seek(&bt_out, samples * sizeof(int16_t));
@@ -1378,6 +1439,12 @@ retry_sco_write:
 			ssize_t samples;
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				buffer = (int16_t *)msbc.dec_pcm.data;
+				samples = ffb_len_out(&msbc.dec_pcm) / sizeof(int16_t);
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				buffer = (int16_t *)bt_in.data;
@@ -1391,6 +1458,11 @@ retry_sco_write:
 				error("FIFO write error: %s", strerror(errno));
 
 			switch (t->codec) {
+#if ENABLE_MSBC
+			case HFP_CODEC_MSBC:
+				ffb_rewind(&msbc.dec_pcm, samples * sizeof(int16_t));
+				break;
+#endif
 			case HFP_CODEC_CVSD:
 			default:
 				ffb_rewind(&bt_in, samples * sizeof(int16_t));
@@ -1399,13 +1471,16 @@ retry_sco_write:
 		}
 
 		/* keep data transfer at a constant bit rate */
-		asrsync_sync(&asrs, 48 / 2);
+		asrsync_sync(&asrs, t->mtu_write / 2);
 		t->delay = asrs.ts_busy.tv_nsec / 100000;
 
 	}
 
 fail:
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+#if ENABLE_MSBC
+	pthread_cleanup_pop(1);
+#endif
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);

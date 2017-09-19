@@ -16,6 +16,7 @@
 #include "../src/bluealsa.c"
 #include "../src/ctl.c"
 #include "../src/io.c"
+#include "../src/msbc.c"
 #include "../src/rfcomm.c"
 #include "../src/transport.c"
 #include "../src/utils.c"
