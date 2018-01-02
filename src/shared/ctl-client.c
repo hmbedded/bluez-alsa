@@ -418,3 +418,40 @@ int bluealsa_drain_transport(int fd, const struct msg_transport *transport) {
 
 	return bluealsa_send_request(fd, &req);
 }
+
+/**
+ * Set transport volume
+ *
+ * @param fd Opened socket file descriptor.
+ * @param transport Address to the transport structure with the addr, type
+ *   and stream fields set - other fields are not used by this function.
+ * @param if zero mute ch1
+ * @param if zero mute ch2
+ * @param ch1 volume (range 0, 127)
+ * @param ch2 volume (range 0, 127)
+ * @return Upon success this function returns 0. Otherwise, -1 is returned. */
+int bluealsa_set_transport_volume(int fd, const struct msg_transport *transport,
+									uint8_t ch1_muted, uint8_t ch2_muted,
+									uint8_t ch1_volume, uint8_t ch2_volume) {
+
+	struct request req = {
+		.command = COMMAND_TRANSPORT_SET_VOLUME,
+		.addr = transport->addr,
+		.stream = transport->stream,
+		.type = transport->type,
+		.ch1_muted = ch1_muted,
+		.ch1_volume = ch1_volume,
+		.ch2_muted = ch2_muted,
+		.ch2_volume = ch2_volume,
+	};
+
+#if DEBUG
+	char addr_[18];
+	ba2str_(&req.addr, addr_);
+	debug("Requesting Set Transport Volume for %s", addr_);
+	debug("Mute ch1: %d, Mute ch2: %d", ch1_muted, ch2_muted);
+	debug("Volume ch1: %d, Volume ch2: %d", ch1_volume, ch2_volume);
+#endif
+
+	return bluealsa_send_request(fd, &req);
+}

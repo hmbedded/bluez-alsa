@@ -30,5 +30,7 @@ int bluealsa_open_transport(int fd, const struct msg_transport *transport);
 int bluealsa_close_transport(int fd, const struct msg_transport *transport);
 int bluealsa_pause_transport(int fd, const struct msg_transport *transport, bool pause);
 int bluealsa_drain_transport(int fd, const struct msg_transport *transport);
-
+int bluealsa_set_transport_volume(int fd, const struct msg_transport *transport,
+									uint8_t ch1_muted, uint8_t ch2_muted,
+									uint8_t ch1_volume, uint8_t ch2_volume);
 #endif
