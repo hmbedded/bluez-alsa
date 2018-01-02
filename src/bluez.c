@@ -18,6 +18,7 @@
 #include <gio/gunixfdlist.h>
 
 #include "a2dp-codecs.h"
+#include "ctl.h"
 #include "bluealsa.h"
 #include "bluez-a2dp.h"
 #include "bluez-iface.h"
@@ -1061,6 +1062,7 @@ static void bluez_signal_transport_changed(GDBusConnection *conn, const gchar *s
 
 			/* received volume is in range [0, 127]*/
 			t->a2dp.ch1_volume = t->a2dp.ch2_volume = g_variant_get_uint16(value);
+			bluealsa_ctl_event(EVENT_TRANSPORT_VOLUME_UPDATE);
 
 		}
 
