@@ -13,6 +13,7 @@
 #endif
 
 #include <getopt.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -27,6 +28,7 @@
 
 #include "shared/ctl-client.h"
 #include "shared/log.h"
+#include "volume_mapping.h"
 
 /* Casting wrapper for the brevity's sake. */
 #define CANCEL_ROUTINE(f) ((void (*)(void *))(f))
@@ -43,8 +45,15 @@ struct pcm_worker {
 	bool eviction;
 	/* if true, playback is active */
 	bool active;
+	/* mixer element pointer */
+	snd_mixer_elem_t *melem;
 	/* human-readable BT address */
 	char addr[18];
+};
+
+struct melem_private {
+	int ba_fd;
+	struct msg_transport *transports;
 };
 
 static unsigned int verbose = 0;
@@ -54,6 +63,8 @@ static unsigned int pcm_buffer_time = 500000;
 static unsigned int pcm_period_time = 100000;
 static enum pcm_type ba_type = PCM_TYPE_A2DP;
 static bool pcm_mixer = true;
+static const char *volume_control = NULL;
+static int transport_volume = -1;
 
 static GDBusConnection *dbus = NULL;
 
@@ -222,6 +233,21 @@ final:
 	return ret;
 }
 
+static void set_transport_volume(int ba_fd, snd_mixer_elem_t *elem, struct msg_transport *t, int flag) {
+
+	double alsa_vol;
+	int volume;
+	int i;
+	
+	alsa_vol = get_normalized_playback_volume(elem, SND_MIXER_SCHN_FRONT_LEFT);
+	volume = lrint(127.*alsa_vol);
+
+	if ((flag) || (volume != transport_volume))
+		bluealsa_set_transport_volume(ba_fd, t, 0, 0, volume, volume);
+
+	transport_volume = volume;
+}
+
 static void pcm_worker_routine_exit(struct pcm_worker *worker) {
 	if (worker->pcm_fd != -1) {
 		bluealsa_close_transport(worker->ba_fd, &worker->transport);
@@ -313,6 +339,10 @@ static void *pcm_worker_routine(void *arg) {
 	if ((w->pcm_fd = bluealsa_open_transport(w->ba_fd, &w->transport)) == -1) {
 		error("Couldn't open PCM FIFO: %s", strerror(errno));
 		goto fail;
+	}
+	
+	if ((w->transport.type == PCM_TYPE_A2DP) && (w->melem)) {
+		set_transport_volume(w->ba_fd, w->melem, &w->transport, 1);
 	}
 
 	/* These variables determine how and when the pause command will be send
@@ -417,6 +447,63 @@ fail:
 	return NULL;
 }
 
+static int melem_event(snd_mixer_elem_t *elem, unsigned int mask) {
+
+	struct melem_private *mpriv = snd_mixer_elem_get_callback_private(elem);
+	struct msg_transport *t;
+	int i;
+
+	for (i = 0; i < workers_count; i++) {
+		t = &mpriv->transports[i];
+		if (t->type == PCM_TYPE_A2DP)
+		set_transport_volume(mpriv->ba_fd, elem, t, 0);
+	}
+
+	return 0;
+}
+
+static snd_mixer_elem_t* init_mixer_control(snd_mixer_t **handle, const char *device, const char *name)
+{
+	snd_mixer_elem_t *elem = NULL;
+	int err;
+	
+	if ((err = snd_mixer_open(handle, 0)) < 0) {
+		error("Mixer open error: %s", snd_strerror(err));
+		goto fail;
+	}
+	
+	if ((err = snd_mixer_attach(*handle, device)) < 0) {
+		error("Mixer attach %s error: %s", device, snd_strerror(err));
+		snd_mixer_close(*handle);
+		goto fail;
+	}
+	
+	if ((err = snd_mixer_selem_register(*handle, NULL, NULL)) < 0) {
+		error("Mixer register error: %s", snd_strerror(err));
+		snd_mixer_close(*handle);
+		goto fail;
+	}
+	
+	if ((err = snd_mixer_load(*handle)) < 0) {
+		error("Mixer %s load error: %s", device, snd_strerror(err));
+		snd_mixer_close(*handle);
+		goto fail;
+	}
+	
+	for (elem = snd_mixer_first_elem(*handle); elem; elem = snd_mixer_elem_next(elem)) {
+		if (!strcmp(snd_mixer_selem_get_name(elem), name))
+			break;
+	}
+	
+	snd_mixer_elem_set_callback(elem, melem_event);
+	
+	if (elem)
+		debug("Mixer Control Element Name: %s", snd_mixer_selem_get_name(elem));
+
+fail:
+	return elem;
+}
+
 int main(int argc, char *argv[]) {
 
 	int opt;
@@ -432,8 +519,14 @@ int main(int argc, char *argv[]) {
 		{ "profile-a2dp", no_argument, NULL, 1 },
 		{ "profile-sco", no_argument, NULL, 2 },
 		{ "single-audio", no_argument, NULL, 5 },
+		{ "volume-control", required_argument, NULL, 6},
 		{ 0, 0, 0, 0 },
 	};
+	snd_mixer_t *h_mixer = NULL;
+	snd_mixer_elem_t *melem = NULL;
+	struct melem_private mpriv;
+	int npfds;
+	struct pollfd *pfds;
 
 	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
 		switch (opt) {
@@ -452,6 +545,7 @@ usage:
 					"  --profile-a2dp\tuse A2DP profile\n"
 					"  --profile-sco\t\tuse SCO profile\n"
 					"  --single-audio\tsingle audio mode\n"
+					"  --volume-control\talsa volume control to use\n"
 					"\nNote:\n"
 					"If one wants to receive audio from more than one Bluetooth device, it is\n"
 					"possible to specify more than one MAC address. By specifying any/empty MAC\n"
@@ -491,6 +585,10 @@ usage:
 
 		case 5 /* --single-audio */ :
 			pcm_mixer = false;
+			break;
+
+		case 6 /* --volume-control */ :
+			volume_control = optarg;
 			break;
 
 		default:
@@ -563,7 +661,7 @@ usage:
 		goto fail;
 	}
 
-	if (bluealsa_subscribe(ba_fd, EVENT_TRANSPORT_ADDED | EVENT_TRANSPORT_REMOVED) == -1) {
+	if (bluealsa_subscribe(ba_fd, EVENT_TRANSPORT_ADDED | EVENT_TRANSPORT_REMOVED | EVENT_TRANSPORT_VOLUME_UPDATE) == -1) {
 		error("BlueALSA subscription failed: %s", strerror(errno));
 		goto fail;
 	}
@@ -571,6 +669,18 @@ usage:
 	struct sigaction sigact = { .sa_handler = main_loop_stop };
 	sigaction(SIGTERM, &sigact, NULL);
 	sigaction(SIGINT, &sigact, NULL);
+
+	if (volume_control)
+		melem = init_mixer_control(&h_mixer, device, volume_control);
+	if (melem) {
+		snd_mixer_elem_set_callback_private(melem, &mpriv);
+		npfds = snd_mixer_poll_descriptors_count(h_mixer);
+	}
+
+	if ((pfds = calloc(npfds+1, sizeof(*pfds))) == NULL) {
+		error("Calloc for poll descriptors failed: %s", strerror(errno));
+		goto fail;
+	}
 
 	debug("Starting main loop");
 	goto init;
@@ -581,103 +691,144 @@ usage:
 		struct msg_transport *transports;
 		ssize_t ret;
 		size_t i;
+		unsigned short revents;
+		
 
-		struct pollfd pfds[] = {{ ba_fd, POLLIN, 0 }};
-		if (poll(pfds, sizeof(pfds) / sizeof(*pfds), -1) == -1 && errno == EINTR)
+		pfds[0].fd = ba_fd;
+		pfds[0].events = POLLIN;
+		pfds[0].revents = 0;
+		if (npfds)
+			snd_mixer_poll_descriptors(h_mixer, &pfds[1], npfds);
+		if (poll(pfds, npfds+1, -1) == -1 && errno == EINTR)
 			continue;
-
-		while ((ret = recv(ba_fd, &event, sizeof(event), MSG_DONTWAIT)) == -1 && errno == EINTR)
-			continue;
-		if (ret != sizeof(event)) {
-			error("Couldn't read event: %s", strerror(ret == -1 ? errno : EBADMSG));
+		
+		if ((ret = snd_mixer_poll_descriptors_revents(h_mixer, &pfds[1], npfds, &revents)) < 0) {
+			error("snd_mixer_poll_descriptors_revents error: %d\n", ret);
 			goto fail;
 		}
+		if (revents & POLLIN) {
+			mpriv.ba_fd = ba_fd;
+			mpriv.transports = transports;
+			snd_mixer_handle_events(h_mixer);
+		}
 
+		if (pfds[0].revents & POLLIN) {
+			while ((ret = recv(ba_fd, &event, sizeof(event), MSG_DONTWAIT)) == -1 && errno == EINTR)
+				continue;
+			if (ret != sizeof(event)) {
+				error("Couldn't read event: %s", strerror(ret == -1 ? errno : EBADMSG));
+				goto fail;
+			}
+
+			if (event.mask & EVENT_TRANSPORT_VOLUME_UPDATE) {
+				if (melem) {
+					struct msg_transport *t;
+					double alsa_vol;
+					int delta;
+
+					for (i = 0; i < workers_count; i++) {
+						if (transports[i].type == PCM_TYPE_A2DP) {
+							t = bluealsa_get_transport(ba_fd, transports[i].addr, transports[i].type, transports[i].stream);
+							if (t->ch1_volume != transport_volume) {
+								alsa_vol = get_normalized_playback_volume(melem, SND_MIXER_SCHN_FRONT_LEFT);
+								delta = t->ch1_volume - lrint(127.*alsa_vol);
+								set_normalized_playback_volume(melem, alsa_vol + delta/127., delta);
+							}
+						}
+					}
+				}
+				else {
+					continue;
+				}
+			}
+	
 init:
-		debug("Fetching available transports");
-		if ((ret = bluealsa_get_transports(ba_fd, &transports)) == -1) {
-			error("Couldn't get transports: %s", strerror(errno));
-			goto fail;
-		}
-
-		for (i = 0; i < workers_count; i++)
-			workers[i].eviction = true;
-
-		for (i = 0; i < (unsigned)ret; i++) {
-
-			size_t ii;
-
-			/* filter available transports by BT address (this check is omitted if
-			 * any address can be used), transport type and stream direction */
-			if (transports[i].type != ba_type)
-				continue;
-			if (transports[i].stream != PCM_STREAM_CAPTURE && transports[i].stream != PCM_STREAM_DUPLEX)
-				continue;
-			if (!ba_addr_any) {
+			debug("Fetching available transports");
+			if ((ret = bluealsa_get_transports(ba_fd, &transports)) == -1) {
+				error("Couldn't get transports: %s", strerror(errno));
+				goto fail;
+			}
+	
+			for (i = 0; i < workers_count; i++)
+				workers[i].eviction = true;
+	
+			for (i = 0; i < (unsigned)ret; i++) {
+	
+				size_t ii;
+	
+				/* filter available transports by BT address (this check is omitted if
+				 * any address can be used), transport type and stream direction */
+				if (transports[i].type != ba_type)
+					continue;
+				if (transports[i].stream != PCM_STREAM_CAPTURE && transports[i].stream != PCM_STREAM_DUPLEX)
+					continue;
+				if (!ba_addr_any) {
+					bool matched = false;
+					for (ii = 0; ii < ba_addrs_count; ii++)
+						if (bacmp(&ba_addrs[ii], &transports[i].addr) == 0) {
+							matched = true;
+							break;
+						}
+					if (!matched)
+						continue;
+				}
+	
 				bool matched = false;
-				for (ii = 0; ii < ba_addrs_count; ii++)
-					if (bacmp(&ba_addrs[ii], &transports[i].addr) == 0) {
+				for (ii = 0; ii < workers_count; ii++)
+					if (bacmp(&workers[ii].transport.addr, &transports[i].addr) == 0) {
+						workers[ii].eviction = false;
 						matched = true;
 						break;
 					}
-				if (!matched)
-					continue;
-			}
-
-			bool matched = false;
-			for (ii = 0; ii < workers_count; ii++)
-				if (bacmp(&workers[ii].transport.addr, &transports[i].addr) == 0) {
-					workers[ii].eviction = false;
-					matched = true;
-					break;
-				}
-
-			/* start PCM worker thread */
-			if (!matched) {
-				workers_count++;
-
-				if (workers_size < workers_count) {
-
-					pthread_rwlock_wrlock(&workers_lock);
-
-					workers_size += 4; /* coarse-grained realloc */
-					if ((workers = realloc(workers, sizeof(*workers) * workers_size)) == NULL) {
-						error("Couldn't (re)allocate memory for PCM workers");
-						goto fail;
+	
+				/* start PCM worker thread */
+				if (!matched) {
+					workers_count++;
+	
+					if (workers_size < workers_count) {
+	
+						pthread_rwlock_wrlock(&workers_lock);
+	
+						workers_size += 4; /* coarse-grained realloc */
+						if ((workers = realloc(workers, sizeof(*workers) * workers_size)) == NULL) {
+							error("Couldn't (re)allocate memory for PCM workers");
+							goto fail;
+						}
+	
+						pthread_rwlock_unlock(&workers_lock);
+	
 					}
-
-					pthread_rwlock_unlock(&workers_lock);
-
+	
+					struct pcm_worker *worker = &workers[workers_count - 1];
+					memcpy(&worker->transport, &transports[i], sizeof(worker->transport));
+					ba2str(&worker->transport.addr, worker->addr);
+					worker->eviction = false;
+					worker->active = false;
+					worker->pcm_fd = -1;
+					worker->ba_fd = -1;
+					worker->melem = melem;
+	
+					debug("Creating PCM worker %s", worker->addr);
+	
+					int ret;
+					if ((ret = pthread_create(&worker->thread, NULL, pcm_worker_routine, worker)) != 0) {
+						warn("Couldn't create PCM worker %s: %s", worker->addr, strerror(ret));
+						workers_count--;
+					}
+	
 				}
-
-				struct pcm_worker *worker = &workers[workers_count - 1];
-				memcpy(&worker->transport, &transports[i], sizeof(worker->transport));
-				ba2str(&worker->transport.addr, worker->addr);
-				worker->eviction = false;
-				worker->active = false;
-				worker->pcm_fd = -1;
-				worker->ba_fd = -1;
-
-				debug("Creating PCM worker %s", worker->addr);
-
-				int ret;
-				if ((ret = pthread_create(&worker->thread, NULL, pcm_worker_routine, worker)) != 0) {
-					warn("Couldn't create PCM worker %s: %s", worker->addr, strerror(ret));
+	
+			}
+	
+			/* stop PCM workers designated for eviction */
+			for (i = workers_count; i > 0; i--) {
+				struct pcm_worker *worker = &workers[i - 1];
+				if (worker->eviction) {
+					pthread_cancel(worker->thread);
+					pthread_join(worker->thread, NULL);
+					memcpy(worker, &workers[workers_count - 1], sizeof(*worker));
 					workers_count--;
 				}
-
-			}
-
-		}
-
-		/* stop PCM workers designated for eviction */
-		for (i = workers_count; i > 0; i--) {
-			struct pcm_worker *worker = &workers[i - 1];
-			if (worker->eviction) {
-				pthread_cancel(worker->thread);
-				pthread_join(worker->thread, NULL);
-				memcpy(worker, &workers[workers_count - 1], sizeof(*worker));
-				workers_count--;
 			}
 		}
 
